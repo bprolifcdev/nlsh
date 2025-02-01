@@ -2,155 +2,178 @@
 import argparse
 import json
 import os
-import platform
 import re
 import subprocess
 import sys
 
+# Store command execution history
+command_history = []
+
 def get_system_info():
     """
-    Gather basic system information from /etc/os-release and platform.
-    Returns a string with OS name, version, kernel, architecture, and package manager.
+    Gather basic system information and return it as a formatted string.
     """
-    os_name = "unknown"
-    os_version = "unknown"
-    if os.path.exists("/etc/os-release"):
-        try:
-            with open("/etc/os-release") as f:
-                for line in f:
-                    if line.startswith("ID="):
-                        os_name = line.split("=")[1].strip().strip('"')
-                    elif line.startswith("VERSION_ID="):
-                        os_version = line.split("=")[1].strip().strip('"')
-        except Exception as e:
-            print("Error reading /etc/os-release:", e, file=sys.stderr)
-    kernel = platform.release()
-    arch = platform.machine()
-    pkg_manager = "dnf"
-    if os_name.lower() in ("ubuntu", "debian"):
-        pkg_manager = "apt-get"
-    return f"OS: {os_name} {os_version}; Kernel: {kernel}; Arch: {arch}; Package Manager: {pkg_manager}"
-
-def query_ollama(query, sys_info):
-    """
-    Builds the prompt and calls the local Ollama model.
-    Returns the raw output (string) from Ollama.
-    """
-    prompt = (
-        f'You are a Linux automation assistant.\n'
-        f'The user\'s query is: "{query}".\n'
-        f'Local system context: {sys_info}.\n'
-        f'Your task is to generate a JSON array containing one or more objects.\n'
-        f'Each object MUST have exactly one key "command" whose value is a single, simple, executable shell command that accomplishes the query on a Fedora system.\n'
-        f'Do not output any extra keys, commentary, markdown, or escape characters.\n'
-        f'Output exactly and only a valid JSON array.'
-    )
     try:
-        result = subprocess.run(
-            ["ollama", "run", "llama3.2:latest"],
-            input=prompt,
-            text=True,
-            capture_output=True,
-            check=True
-        )
-        return result.stdout
-    except subprocess.CalledProcessError as e:
-        print("Error calling Ollama:", e, file=sys.stderr)
-        return None
+        os_name = subprocess.run(["uname", "-o"], capture_output=True, text=True).stdout.strip()
+        kernel = subprocess.run(["uname", "-r"], capture_output=True, text=True).stdout.strip()
+        arch = subprocess.run(["uname", "-m"], capture_output=True, text=True).stdout.strip()
+        package_manager = "dnf" if os.path.exists("/usr/bin/dnf") else "apt-get"
+        return f"OS: {os_name}; Kernel: {kernel}; Arch: {arch}; Package Manager: {package_manager}"
+    except Exception as e:
+        return f"Error gathering system info: {e}"
+
+def command_exists(command):
+    """
+    Check if a command exists using 'command -v'.
+    """
+    cmd = command.split()[0]
+    result = subprocess.run(["command", "-v", cmd], capture_output=True, text=True)
+    return result.returncode == 0
+
+def is_command_valid(command):
+    """
+    Validate the command by checking its existence and testing --help.
+    """
+    cmd_parts = command.split()
+    if len(cmd_parts) > 1:
+        try:
+            result = subprocess.run([cmd_parts[0], "--help"], capture_output=True, text=True)
+            return result.returncode == 0
+        except Exception:
+            return False
+    return True
 
 def extract_json_array(raw_output):
     """
-    Attempts to extract a JSON array from raw_output by locating the first '[' and the last ']'.
-    Returns the substring if found, otherwise None.
+    Extracts a JSON array from raw_output if present.
     """
-    match = re.search(r'\[.*\]', raw_output, re.DOTALL)
-    if match:
-        return match.group(0)
-    return None
+    try:
+        # Use regex to extract only the JSON portion
+        match = re.search(r"\[\s*{.*?}\s*\]", raw_output, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        else:
+            print("⚠️ No valid JSON found. Treating as plaintext command.", file=sys.stderr)
+            return None
+    except json.JSONDecodeError:
+        print("❌ JSON Parsing Error: Could not decode valid JSON.", file=sys.stderr)
+        return None
 
 def process_output(raw_output):
     """
-    Cleans the raw output by trying to extract a JSON array.
-    If none is found, treats the output as a plain text command and wraps it in a JSON array.
-    If the JSON is an array of strings, converts it to an array of objects with a "command" key.
-    Returns the resulting Python list or None on error.
+    Processes AI-generated commands and filters out invalid ones.
     """
-    json_str = extract_json_array(raw_output)
-    if not json_str:
-        # If no JSON array was found, assume raw_output is a plain text command.
-        print("Failed to locate a JSON array in the output.", file=sys.stderr)
-        print("Raw output:", raw_output, file=sys.stderr)
-        # Wrap the trimmed raw output in a JSON array.
-        json_str = json.dumps([raw_output.strip()])
-        print("Using wrapped output:", json_str, file=sys.stderr)
-    try:
-        data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        print("JSON decode error:", e, file=sys.stderr)
-        print("Attempted JSON string:", json_str, file=sys.stderr)
+    commands = extract_json_array(raw_output)
+    if not commands:
+        print("⚠️ No valid JSON found. Treating as plaintext command.", file=sys.stderr)
+        commands = [raw_output.strip()]
+    
+    if isinstance(commands, list) and all(isinstance(cmd, str) for cmd in commands):
+        commands = [{"command": cmd} for cmd in commands]
+    
+    valid_commands = [cmd for cmd in commands if command_exists(cmd["command"])]
+    
+    if not valid_commands:
+        print("❌ No valid commands found. AI might have generated incorrect commands.", file=sys.stderr)
         return None
-    # Convert an array of strings to an array of objects if needed.
-    if isinstance(data, list) and data and all(isinstance(item, str) for item in data):
-        data = [{"command": item} for item in data]
-    return data
+    
+    return valid_commands
 
 def present_menu(commands):
     """
-    Presents a numbered menu of commands to the user.
-    Returns the selected command (string) or exits if the user quits.
+    Presents a menu of generated commands for selection.
     """
-    print("Available commands:")
-    for idx, cmd_obj in enumerate(commands):
-        print(f"{idx+1}) {cmd_obj.get('command')}")
-    choice = input("Select the command number to execute (or q to quit): ").strip()
+    print("\n📋 Available Commands:")
+    for i, cmd_obj in enumerate(commands):
+        print(f"{i+1}) {cmd_obj.get('command')}")
+    choice = input("\nSelect command number to execute (or q to quit): ").strip()
     if choice.lower() == 'q':
         sys.exit(0)
     try:
-        index = int(choice) - 1
-        if index < 0 or index >= len(commands):
-            print("Invalid selection.")
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(commands):
+            print("❌ Invalid selection.")
             sys.exit(1)
-        return commands[index]["command"]
+        return commands[idx]["command"]
     except ValueError:
-        print("Invalid input. Exiting.")
+        print("❌ Invalid input. Exiting.")
+        sys.exit(1)
+
+def execute_command(command):
+    """
+    Executes the selected command with safety checks and tracks history.
+    """
+    global command_history
+    if not is_command_valid(command):
+        print(f"⚠️ Skipping invalid command: {command}")
+        return
+    
+    print(f"\n➡️ Executing: {command}")
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        command_history.append({"command": command, "status": "success" if result.returncode == 0 else "failed", "output": result.stderr if result.returncode else result.stdout})
+        
+        if result.returncode == 0:
+            print(result.stdout)
+        else:
+            print(f"⚠️ Command failed with exit code {result.returncode}: {command}")
+            print(result.stderr)
+    except Exception as e:
+        command_history.append({"command": command, "status": "error", "output": str(e)})
+        print(f"⚠️ Error executing command: {e}")
+
+def query_ollama(query):
+    """
+    Generates shell commands using Ollama with system context and execution history.
+    """
+    sys_info = get_system_info()
+
+    # Format command history into a readable context
+    history_context = "\n".join([f"- {entry['command']} (Status: {entry['status']})" for entry in command_history[-5:]])
+
+    full_prompt = f"""
+    You are a command-line assistant helping users execute shell commands efficiently.
+    The user is running a system with the following specifications:
+    {sys_info}
+
+    Previous command history:
+    {history_context if history_context else "No previous commands"}
+
+    Generate a single valid shell command based on the following query:
+    "{query}"
+
+    If a previous command failed, correct the mistake in your response.
+
+    Respond in JSON format as:
+    [
+        {{"command": "actual_command_here"}}
+    ]
+    """
+    try:
+        result = subprocess.run(["ollama", "run", "llama3.2:latest"], input=full_prompt, text=True, capture_output=True, check=True)
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        print("❌ Failed to get output from Ollama.", file=sys.stderr)
         sys.exit(1)
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Natural Language Shell Helper using Ollama (Python version)"
-    )
+    parser = argparse.ArgumentParser(description="Natural Language Shell Helper using Ollama")
     parser.add_argument("query", nargs="+", help="The natural language query to generate shell commands for")
     args = parser.parse_args()
-    
+
     query = " ".join(args.query)
-    sys_info = get_system_info()
-    print("System info:", sys_info)
-    
-    raw_output = query_ollama(query, sys_info)
-    if raw_output is None:
-        print("Failed to get output from Ollama.", file=sys.stderr)
-        sys.exit(1)
-    
-    # For development: print the raw output for debugging.
-    print("Raw output:")
-    print(raw_output)
-    
+    print("🔍 System info:", get_system_info())
+
+    raw_output = query_ollama(query)
+    print("\n📝 Raw output from Ollama:\n", raw_output)
+
     commands = process_output(raw_output)
-    if not commands or not isinstance(commands, list):
-        print("No valid commands found in Ollama output.", file=sys.stderr)
+    if not commands:
+        print("❌ No valid commands found.", file=sys.stderr)
         sys.exit(1)
-    
-    print("Generated commands:")
-    for cmd in commands:
-        print(cmd)
-    
+
     selected_command = present_menu(commands)
-    print(f"Executing: {selected_command}")
-    ret = subprocess.call(selected_command, shell=True)
-    if ret == 0:
-        print("Command executed successfully.")
-    else:
-        print(f"Command failed with exit code {ret}.")
+    execute_command(selected_command)
 
 if __name__ == "__main__":
     main()
